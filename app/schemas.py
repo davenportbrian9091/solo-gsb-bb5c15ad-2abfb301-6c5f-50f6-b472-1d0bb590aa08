@@ -90,6 +90,18 @@ class FlagVersionResponse(BaseModel):
     created_at: Any
 
 
+class RollbackRequest(BaseModel):
+    """版本回滚请求：把历史版本复制为新当前版本（乐观并发控制）。"""
+
+    target_version: int = Field(
+        ge=1, description="要复制为新当前版本的历史版本号"
+    )
+    expected_current_version: int = Field(
+        ge=1,
+        description="调用方认为的当前版本号；与实际当前版本不一致时返回 409，不改动数据",
+    )
+
+
 class EvaluateRequest(BaseModel):
     flag_key: str | None = Field(default=None, max_length=128, description="路径式调用可省略")
     user_id: str = Field(min_length=1, max_length=128)

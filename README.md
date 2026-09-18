@@ -62,6 +62,7 @@ curl -sS http://localhost:8000/api/v1/decisions/<request_id>
 | `DELETE` | `/api/v1/flags/{flag_key}` | 删除开关（版本历史一并删除） |
 | `GET` | `/api/v1/flags/{flag_key}/versions` | 列出全部配置版本（按版本号升序） |
 | `GET` | `/api/v1/flags/{flag_key}/versions/{version}` | 查看指定版本的完整配置 |
+| `POST` | `/api/v1/flags/{flag_key}/rollback` | 将指定历史版本复制为新当前版本（乐观版本检查，返回 `201`） |
 | `POST` | `/api/v1/flags/{flag_key}/evaluate` | 判定（推荐，flag_key 在路径中，可指定 `config_version`） |
 | `POST` | `/api/v1/flags/{flag_key}/preview-impact` | 发布前候选配置影响预览（只读，不写版本 / 快照） |
 | `POST` | `/api/v1/evaluate` | 判定（flag_key 在请求体中） |
@@ -130,6 +131,33 @@ curl -sS -X POST http://localhost:8000/api/v1/flags/btn_color/evaluate \
 ```
 
 删除开关会一并删除其版本历史；同名开关重建后版本号从 `1` 重新开始。
+
+### 版本回滚（历史版本复制为新版本）
+
+需要把线上配置恢复为某个历史版本时，调用 `POST /api/v1/flags/{flag_key}/rollback`。回滚**不会删除或覆盖任何历史版本**，而是把目标历史版本的完整配置复制一份，在**同一事务**中追加为新的当前版本（版本号在当前版本上 `+1`）：
+
+```bash
+# 当前为 v3，把 v1 的配置复制为新的 v4 并立即生效
+curl -sS -X POST http://localhost:8000/api/v1/flags/btn_color/rollback \
+  -H 'Content-Type: application/json' \
+  -d '{"target_version": 1, "expected_current_version": 3}'
+```
+
+请求字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `target_version` | 要复制的历史版本号，必须 `>= 1`；不存在返回 `404` |
+| `expected_current_version` | 调用方认为的当前版本号（乐观并发检查），必须 `>= 1` |
+
+行为约定：
+
+- 成功返回 `201`，响应体与创建 / 更新接口的 `FlagResponse` 结构一致，`version` 为新版本号，配置内容（`description` / `variants` / `rules`）与 `target_version` 完全相同；
+- 仅当开关存在**且**实际当前版本等于 `expected_current_version` 时才写入；期望版本过期（已被其他发布推进）返回 **`409 Conflict` 且不改动任何数据**（版本历史也不追加），调用方重新读取当前版本后可重试；
+- 开关不存在返回 `404`；开关存在但 `target_version` 历史版本不存在同样返回 `404`；
+- 字段缺失或版本号小于 `1` 返回 `422`；
+- `target_version` 等于当前版本时也允许调用，效果是追加一份与当前内容相同的新版本快照；
+- 回滚产生的新版本与普通更新产生的版本没有区别，之后继续更新会在其版本号上顺序递增；回滚前的判定快照仍记录各自的 `config_version`，可用 `config_version` 继续钉住任意历史版本判定。
 
 ### 规则操作符
 
@@ -295,7 +323,7 @@ bucket = int.from_bytes(sha256(f"{flag_key}:{user_id}")[:8], "big") % 100
 │   ├── crud.py        # 配置、版本与快照持久化（含分页查询与索引补齐）
 │   ├── models.py      # SQLAlchemy ORM（flag_configs / flag_config_versions / decision_snapshots）
 │   └── database.py    # 引擎与会话
-├── tests/             # pytest：引擎单测 + API 集成测试（64 项）
+├── tests/             # pytest：引擎单测 + API 集成测试（71 项）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

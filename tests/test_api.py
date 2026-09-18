@@ -400,6 +400,164 @@ def test_delete_flag_removes_versions(client):
 
 
 # ---------------------------------------------------------------------------
+# POST /api/v1/flags/{flag_key}/rollback
+# ---------------------------------------------------------------------------
+
+
+def test_rollback_copies_historical_version_as_new_current(client):
+    v1, v2 = _versioned_flag(client)
+
+    resp = client.post(
+        "/api/v1/flags/ver_flag/rollback",
+        json={"target_version": 1, "expected_current_version": 2},
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    # 新版本号为当前版本 + 1
+    assert body["version"] == 3
+    # 当前配置内容复制自 v1
+    assert body["description"] == "v1"
+    assert body["rules"][0]["variant_key"] == "a"
+    assert {v["key"]: v["weight"] for v in body["variants"]} == {"a": 50, "b": 50}
+
+    # GET 单个开关同样看到 v3 内容
+    current = client.get("/api/v1/flags/ver_flag").json()
+    assert current["version"] == 3
+    assert current["rules"][0]["variant_key"] == "a"
+
+    # 历史版本列表追加一行：[1, 2, 3]，旧版本保持不变
+    versions = client.get("/api/v1/flags/ver_flag/versions").json()
+    assert [v["version"] for v in versions] == [1, 2, 3]
+    assert versions[2]["description"] == "v1"
+    assert versions[2]["rules"][0]["variant_key"] == "a"
+    assert versions[0]["description"] == "v1"
+    assert versions[1]["description"] == "v2"
+    assert versions[1]["rules"][0]["variant_key"] == "b"
+
+    # 回滚后缺省判定按新版本（v3，内容同 v1）执行
+    decision = client.post(
+        "/api/v1/flags/ver_flag/evaluate",
+        json={"user_id": "u1", "context": {"region": "cn"}},
+    ).json()
+    assert decision["config_version"] == 3
+    assert decision["variant_key"] == "a"
+
+    # 目标历史版本仍可单独钉用
+    pinned = client.get("/api/v1/flags/ver_flag/versions/1").json()
+    assert pinned["version"] == 1
+    assert pinned["rules"][0]["variant_key"] == "a"
+
+
+def test_rollback_stale_expected_version_returns_409_and_changes_nothing(client):
+    _versioned_flag(client)  # 当前版本为 2
+
+    before = client.get("/api/v1/flags/ver_flag").json()
+    versions_before = client.get("/api/v1/flags/ver_flag/versions").json()
+
+    resp = client.post(
+        "/api/v1/flags/ver_flag/rollback",
+        json={"target_version": 1, "expected_current_version": 1},
+    )
+    assert resp.status_code == 409
+    assert "1" in resp.json()["detail"]
+
+    # 数据完全不变：当前仍为 v2，版本历史仍为 [1, 2]
+    after = client.get("/api/v1/flags/ver_flag").json()
+    assert after == before
+    versions_after = client.get("/api/v1/flags/ver_flag/versions").json()
+    assert versions_after == versions_before
+
+    # 用过期期望回滚失败后，带上正确期望值仍可成功
+    ok = client.post(
+        "/api/v1/flags/ver_flag/rollback",
+        json={"target_version": 1, "expected_current_version": 2},
+    )
+    assert ok.status_code == 201
+    assert ok.json()["version"] == 3
+
+
+def test_rollback_unknown_flag_returns_404(client):
+    resp = client.post(
+        "/api/v1/flags/nope/rollback",
+        json={"target_version": 1, "expected_current_version": 1},
+    )
+    assert resp.status_code == 404
+
+
+def test_rollback_missing_target_version_returns_404(client):
+    _versioned_flag(client)  # 只有版本 1、2
+    resp = client.post(
+        "/api/v1/flags/ver_flag/rollback",
+        json={"target_version": 99, "expected_current_version": 2},
+    )
+    assert resp.status_code == 404
+    assert "99" in resp.json()["detail"]
+
+    # 目标版本缺失时不追加任何新版本
+    versions = client.get("/api/v1/flags/ver_flag/versions").json()
+    assert [v["version"] for v in versions] == [1, 2]
+    assert client.get("/api/v1/flags/ver_flag").json()["version"] == 2
+
+
+def test_rollback_target_current_version_appends_duplicate_copy(client):
+    # 目标版本即当前版本：语义上仍复制为新版本（内容与当前一致的快照）
+    _versioned_flag(client)
+    resp = client.post(
+        "/api/v1/flags/ver_flag/rollback",
+        json={"target_version": 2, "expected_current_version": 2},
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["version"] == 3
+    assert body["description"] == "v2"
+    assert body["rules"][0]["variant_key"] == "b"
+    versions = client.get("/api/v1/flags/ver_flag/versions").json()
+    assert [v["version"] for v in versions] == [1, 2, 3]
+    assert versions[2]["rules"][0]["variant_key"] == "b"
+
+
+def test_rollback_rejects_invalid_version_numbers(client, simple_flag):
+    # 版本号必须 >= 1，Pydantic 层返回 422
+    resp = client.post(
+        "/api/v1/flags/btn_color/rollback",
+        json={"target_version": 0, "expected_current_version": 1},
+    )
+    assert resp.status_code == 422
+    resp = client.post(
+        "/api/v1/flags/btn_color/rollback",
+        json={"target_version": 1, "expected_current_version": 0},
+    )
+    assert resp.status_code == 422
+    # 缺少必填字段同样 422
+    resp = client.post(
+        "/api/v1/flags/btn_color/rollback", json={"target_version": 1}
+    )
+    assert resp.status_code == 422
+
+
+def test_rollback_then_update_continues_version_sequence(client):
+    _versioned_flag(client)  # v1, v2
+    rolled = client.post(
+        "/api/v1/flags/ver_flag/rollback",
+        json={"target_version": 1, "expected_current_version": 2},
+    ).json()
+    assert rolled["version"] == 3
+
+    # 回滚后普通更新继续在新版本号上递增，且追加 v4
+    v4 = {
+        "flag_key": "ver_flag",
+        "description": "v4",
+        "variants": [{"key": "a", "weight": 100}, {"key": "b", "weight": 0}],
+        "rules": [],
+    }
+    resp = client.post("/api/v1/flags", json=v4)
+    assert resp.status_code == 201
+    assert resp.json()["version"] == 4
+    versions = client.get("/api/v1/flags/ver_flag/versions").json()
+    assert [v["version"] for v in versions] == [1, 2, 3, 4]
+
+
+# ---------------------------------------------------------------------------
 # POST /api/v1/flags/{flag_key}/preview-impact
 # ---------------------------------------------------------------------------
 

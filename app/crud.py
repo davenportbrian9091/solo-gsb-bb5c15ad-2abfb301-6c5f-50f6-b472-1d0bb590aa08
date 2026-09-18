@@ -16,6 +16,14 @@ class NotFound(Exception):
     """开关不存在。"""
 
 
+class VersionNotFound(Exception):
+    """指定的历史版本不存在。"""
+
+
+class VersionConflict(Exception):
+    """expected_current_version 与实际当前版本不一致（期望版本已过期）。"""
+
+
 def parse_rules(raw: str) -> list[eng.Rule]:
     return [eng.Rule(**item) for item in json.loads(raw or "[]")]
 
@@ -57,6 +65,51 @@ def upsert_flag(db: Session, payload: FlagUpsertRequest) -> FlagConfig:
             description=payload.description,
             rules_json=rules_json,
             variants_json=variants_json,
+        )
+    )
+    db.commit()
+    db.refresh(flag)
+    return flag
+
+
+def rollback_flag(
+    db: Session, flag_key: str, target_version: int, expected_current_version: int
+) -> FlagConfig:
+    """把指定历史版本复制为新的当前版本（回滚发布）。
+
+    仅当开关存在、实际当前版本等于 expected_current_version、且
+    target_version 历史版本存在时，在**同一事务**中：
+    1. 把目标历史版本的完整配置追加为新的不可变版本（version + 1）；
+    2. 更新当前配置的 description / rules / variants。
+
+    历史版本一律只增不改；期望版本过期抛 VersionConflict（不写入、不提交），
+    目标版本不存在抛 VersionNotFound。
+    """
+    flag = db.scalar(select(FlagConfig).where(FlagConfig.flag_key == flag_key))
+    if flag is None:
+        raise NotFound(flag_key)
+    if flag.version != expected_current_version:
+        raise VersionConflict(
+            f"开关 {flag_key!r} 当前版本为 {flag.version}，与期望版本 "
+            f"{expected_current_version} 不一致"
+        )
+    target = get_flag_version(db, flag_key, target_version)
+    if target is None:
+        raise VersionNotFound(
+            f"开关 {flag_key!r} 没有版本 {target_version}"
+        )
+
+    flag.description = target.description
+    flag.rules_json = target.rules_json
+    flag.variants_json = target.variants_json
+    flag.version += 1
+    db.add(
+        FlagConfigVersion(
+            flag_key=flag_key,
+            version=flag.version,
+            description=target.description,
+            rules_json=target.rules_json,
+            variants_json=target.variants_json,
         )
     )
     db.commit()
