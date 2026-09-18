@@ -62,6 +62,7 @@ curl -sS http://localhost:8000/api/v1/decisions/<request_id>
 | `DELETE` | `/api/v1/flags/{flag_key}` | 删除开关（版本历史一并删除） |
 | `GET` | `/api/v1/flags/{flag_key}/versions` | 列出全部配置版本（按版本号升序） |
 | `GET` | `/api/v1/flags/{flag_key}/versions/{version}` | 查看指定版本的完整配置 |
+| `POST` | `/api/v1/flags/{flag_key}/rollback` | 回滚：复制指定历史版本为新的当前版本（乐观锁，409/404 语义见下） |
 | `POST` | `/api/v1/flags/{flag_key}/evaluate` | 判定（推荐，flag_key 在路径中，可指定 `config_version`） |
 | `POST` | `/api/v1/flags/{flag_key}/preview-impact` | 发布前候选配置影响预览（只读，不写版本 / 快照） |
 | `POST` | `/api/v1/evaluate` | 判定（flag_key 在请求体中） |
@@ -130,6 +131,29 @@ curl -sS -X POST http://localhost:8000/api/v1/flags/btn_color/evaluate \
 ```
 
 删除开关会一并删除其版本历史；同名开关重建后版本号从 `1` 重新开始。
+
+### 回滚到历史版本（复制为新版本）
+
+`POST /api/v1/flags/{flag_key}/rollback` 把某个历史版本的**完整配置**（描述、规则、变体权重）复制为一份**新版本**发布，而不是把当前版本号改回去：
+
+- 请求体包含 `target_version`（要复制的历史版本）与 `expected_current_version`（调用方认为的当前版本）；
+- 仅当开关存在且当前版本号**恰好等于** `expected_current_version` 时才执行：在**同一事务**中追加一条与目标版本内容一致的不可变版本记录（版本号为原当前版本 + 1）、覆盖当前配置并返回新版本（结构同创建接口，`201`）；
+- `expected_current_version` 已过期（当前版本已被其他更新推进）时返回 **`409`**，**不改动任何数据**，历史版本保持不变，调用方应刷新当前版本后重试；
+- `target_version` 不存在返回 **`404`**（开关不存在同样 `404`），也不产生新版本；
+- 所有历史版本（包括被复制的目标版本）**原样保留**，因此可反复回滚、链式回滚；目标版本即当前版本时也会追加一份内容相同的新版本；
+- 版本号必须 `>= 1`、字段缺失等请求体校验失败返回 `422`。
+
+```bash
+# 当前线上为 v3，期望仍是 v2 说明已有人发布过新版本 -> 409，数据不变
+curl -sS -X POST http://localhost:8000/api/v1/flags/btn_color/rollback \
+  -H 'Content-Type: application/json' \
+  -d '{"target_version": 1, "expected_current_version": 3}'
+
+# 期望版本与当前一致：把 v1 的配置复制为 v4 并发布
+curl -sS -X POST http://localhost:8000/api/v1/flags/btn_color/rollback \
+  -H 'Content-Type: application/json' \
+  -d '{"target_version": 1, "expected_current_version": 3}'
+```
 
 ### 规则操作符
 
@@ -295,7 +319,7 @@ bucket = int.from_bytes(sha256(f"{flag_key}:{user_id}")[:8], "big") % 100
 │   ├── crud.py        # 配置、版本与快照持久化（含分页查询与索引补齐）
 │   ├── models.py      # SQLAlchemy ORM（flag_configs / flag_config_versions / decision_snapshots）
 │   └── database.py    # 引擎与会话
-├── tests/             # pytest：引擎单测 + API 集成测试（64 项）
+├── tests/             # pytest：引擎单测 + API 集成测试（70 项）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

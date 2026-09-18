@@ -7,6 +7,7 @@
 - DELETE /api/v1/flags/{flag_key} 删除开关（版本历史一并删除）
 - GET  /api/v1/flags/{flag_key}/versions            列出版本历史
 - GET  /api/v1/flags/{flag_key}/versions/{version}  查看指定版本配置
+- POST /api/v1/flags/{flag_key}/rollback            回滚：复制指定历史版本为新的当前版本（乐观锁）
 - POST /api/v1/flags/{flag_key}/evaluate  判定（按路径中的 flag_key，可指定 config_version）
 - POST /api/v1/flags/{flag_key}/preview-impact  发布前候选配置影响预览（只读，不落版本与快照）
 - POST /api/v1/evaluate           判定（flag_key 在请求体中）
@@ -42,6 +43,7 @@ from app.schemas import (
     PreviewImpactRequest,
     PreviewImpactResponse,
     PreviewOutcome,
+    RollbackRequest,
 )
 
 
@@ -234,6 +236,31 @@ def get_flag_version(flag_key: str, version: int, db: Session = Depends(get_db))
             detail=f"开关 {flag_key!r} 没有版本 {version}",
         )
     return crud.version_to_response(ver)
+
+
+@app.post("/api/v1/flags/{flag_key}/rollback", response_model=FlagResponse, status_code=status.HTTP_201_CREATED)
+def rollback_flag(flag_key: str, payload: RollbackRequest, db: Session = Depends(get_db)):
+    """把指定历史版本复制为新的当前版本（不修改任何历史版本）。
+
+    - 仅当开关存在且当前版本号等于 ``expected_current_version`` 时执行，
+      在同一事务中追加新版本、覆盖当前配置，返回新版本（版本号为原当前版本 +1）；
+    - 当前版本已被推进、与期望值不一致时返回 ``409``，不改动任何数据；
+    - ``target_version`` 历史版本不存在返回 ``404``；开关不存在同样返回 ``404``。
+    """
+    try:
+        flag = crud.rollback_flag(
+            db,
+            flag_key=flag_key,
+            target_version=payload.target_version,
+            expected_current_version=payload.expected_current_version,
+        )
+    except crud.NotFound as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    except crud.VersionConflict as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    except crud.VersionNotFound as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    return crud.flag_to_response(flag)
 
 
 def _evaluate(req: EvaluateRequest, db: Session, flag_key: str) -> EvaluateResponse:

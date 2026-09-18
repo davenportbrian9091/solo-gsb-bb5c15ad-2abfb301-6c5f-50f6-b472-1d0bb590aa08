@@ -69,6 +69,17 @@ class FlagUpsertRequest(FlagConfigBody):
     description: str = ""
 
 
+class RollbackRequest(BaseModel):
+    """回滚请求：把 target_version 复制为新的当前版本。
+
+    expected_current_version 为乐观锁：仅当当前版本号与之相等时才执行，
+    避免覆盖调用方发起后、提交前发生的并发发布。
+    """
+
+    target_version: int = Field(ge=1, description="要复制的历史版本号")
+    expected_current_version: int = Field(ge=1, description="调用方认为的当前版本号；不一致返回 409")
+
+
 class FlagResponse(BaseModel):
     flag_key: str
     description: str
